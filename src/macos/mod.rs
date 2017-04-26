@@ -32,7 +32,7 @@ pub struct Report {
 unsafe impl Send for Report {}
 unsafe impl Sync for Report {}
 
-pub struct Device {
+pub struct InternalDevice {
     pub name: String,
     pub device_ref: IOHIDDeviceRef,
     // Channel ID for U2F HID communication. Needed to implement U2FDevice
@@ -42,15 +42,9 @@ pub struct Device {
     pub report_send: Sender<Report>,
 }
 
-impl PartialEq for Device {
-    fn eq(&self, other: &Device) -> bool {
-        self.device_ref == other.device_ref
-    }
-}
-
-impl fmt::Display for Device {
+impl fmt::Display for InternalDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Device({}, ptr:{:?}, cid: {:02x}{:02x}{:02x}{:02x})", self.name, self.device_ref,
+        write!(f, "InternalDevice({}, ptr:{:?}, cid: {:02x}{:02x}{:02x}{:02x})", self.name, self.device_ref,
                self.cid[0], self.cid[1], self.cid[2], self.cid[3])
     }
 }
@@ -60,49 +54,27 @@ struct AddedDevice {
     pub report_tx: Sender<Report>,
 }
 
-// fn create_device(dev: IOHIDDeviceRef, name: String) -> Device {
-//     let (mut report_tx, report_rx) = channel::<Report>();
+#[derive(Clone)]
+pub struct Device {
+    pub device: Arc<InternalDevice>,
+}
 
-//     let mut device = Device {
-//         name: name.clone(),
-//         device_ref: dev,
-//         cid: CID_BROADCAST,
-//         report_recv: report_rx,
-//         report_send: report_tx.clone(),
-//     };
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Device({})", self.device)
+    }
+}
 
-//     // Use a barrier to block this function until the thread is ready
-//     // let barrier = Arc::new(Barrier::new(2));
-//     // let barrier_clone = barrier.clone();
-
-//     // Super, super sketchy, but we can't Send a libc::c_void to the thread, yet OSX wants us to do
-//     // just that. An alternative way to accomplish this might be to come up with enough information
-//     // for the thread to re-enumerate this device.
-//     let mut added_device = AddedDevice {
-//         raw_handle: unsafe { ::std::mem::transmute(dev) },
-//         report_tx: report_tx,
-//     };
-//     // device_tx.send(added_device);
-
-
-//     // unsafe {
-//     //     let runloop_ref : CFRunLoopRef = ::std::mem::transmute(runloop_raw_ref);
-//     //     IOHIDDeviceScheduleWithRunLoop(dev, runloop_ref, kCFRunLoopDefaultMode);
-//     // }
-//     // println!("Scheduled");
-
-//     // OK to start the run loop
-//     // barrier.wait();
-//     println!("Barrier unwaited");
-
-
-//     device
-// }
+impl PartialEq for Device {
+    fn eq(&self, other: &Device) -> bool {
+        self.device.device_ref == other.device.device_ref
+    }
+}
 
 impl Read for Device {
     fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<usize> {
         println!("Reading");
-        let report_data = match self.report_recv.recv() {
+        let report_data = match self.device.report_recv.recv() {
             Ok(v) => v,
             Err(e) => panic!("Couldn't read data: {}", e),
         };
@@ -113,7 +85,7 @@ impl Read for Device {
 
 impl Write for Device {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        unsafe { set_report(self.device_ref, kIOHIDReportTypeOutput, bytes) }
+        unsafe { set_report(self.device.device_ref, kIOHIDReportTypeOutput, bytes) }
     }
 
     // USB HID writes don't buffer, so this will be a nop.
@@ -124,10 +96,13 @@ impl Write for Device {
 
 impl U2FDevice for Device {
     fn get_cid(&self) -> [u8; 4] {
-        return self.cid.clone();
+        return self.device.cid.clone();
     }
     fn set_cid(&mut self, cid: &[u8; 4]) {
-        self.cid.clone_from(cid);
+        match Arc::get_mut(&mut self.device) {
+            Some(d) => d.cid.clone_from(cid),
+            None => panic!("Couldn't update CID"),
+        }
     }
 }
 
@@ -219,12 +194,16 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     for device_ref in device_refs {
         let (mut report_tx, report_rx) = channel::<Report>();
 
-        let device = Device {
+        let int_device = InternalDevice {
             name: get_name(device_ref),
             device_ref: device_ref,
             cid: CID_BROADCAST,
             report_recv: report_rx,
             report_send: report_tx.clone(),
+        };
+
+        let device = Device {
+            device: Arc::new(int_device),
         };
 
         added_tx.send(AddedDevice {
@@ -293,7 +272,7 @@ impl PlatformManager {
         // }
         // let mut devices: Vec<Device> = Vec::new();
         // Ok(devices)
-        Ok(self.known_devices)
+        Ok(self.known_devices.clone())
     }
 }
 
