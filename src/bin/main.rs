@@ -23,15 +23,19 @@ impl U2FManager {
 
         if let Ok(ref mut list) = devices.lock() {
             for mut device_obj in try!(platform.find_keys()) {
+                println!("Device seen {}", device_obj);
                 if let Err(_) = u2fhid::init_device(&mut device_obj) {
                     continue
                 }
+                println!("Device inited {}", device_obj);
                 if let Err(_) = u2fhid::ping_device(&mut device_obj) {
                     continue
                 }
+                println!("Device pinged {}", device_obj);
                 if let Err(_) = u2fhid::u2f_version_is_v2(&mut device_obj){
                     continue
                 }
+                println!("Device initialized {}", device_obj);
                 list.push(device_obj);
             }
         }

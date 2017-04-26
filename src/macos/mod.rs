@@ -39,7 +39,7 @@ pub struct Device {
     // trait.
     pub cid: [u8; 4],
     pub report_recv: Receiver<Report>,
-    pub thread: Option<thread::JoinHandle<()>>,
+    pub report_send: Sender<Report>,
 }
 
 impl PartialEq for Device {
@@ -55,68 +55,49 @@ impl fmt::Display for Device {
     }
 }
 
-fn create_device(dev: IOHIDDeviceRef, name: String) -> Device {
-    let (mut tx, rx) = channel();
-
-    let mut device = Device {
-        name: name.clone(),
-        device_ref: dev,
-        cid: CID_BROADCAST,
-        report_recv: rx,
-        thread: None,
-    };
-
-    // Use a barrier to block this function until the thread is ready
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = barrier.clone();
-
-    // Super, super sketchy, but we can't Send a libc::c_void to the thread, yet OSX wants us to do
-    // just that. An alternative way to accomplish this might be to come up with enough information
-    // for the thread to re-enumerate this device.
-    let device_raw_handle : u64 = unsafe { ::std::mem::transmute(dev) };
-
-    device.thread = match thread::Builder::new().name(name).spawn(move || {
-      unsafe {
-          let device_handle : IOHIDDeviceRef = ::std::mem::transmute(device_raw_handle);
-          let tx_ptr: *mut libc::c_void = &mut tx as *mut _ as *mut libc::c_void;
-          let scratch_buf = [0; HID_RPT_SIZE];
-
-          IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
-                                                 scratch_buf.len() as CFIndex,
-                                                 read_new_data_cb, tx_ptr);
-
-          IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-
-          barrier_clone.wait();
-
-          // Run the Event Loop. CFRunLoopRunInMode() will dispatch HID input reports into the
-          // read_new_data_cb() callback.
-          loop {
-            println!("Run loop running, deviceRef={:?}", device_handle);
-            #[allow(non_upper_case_globals)]
-            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, 0) {
-              kCFRunLoopRunFinished => {
-                println!("Device disconnected.");
-                return;
-              },
-              kCFRunLoopRunStopped => {
-                println!("Device stopped.");
-                return;
-              },
-              _ => {},
-            }
-          }
-      }
-
-    }) {
-      Ok(t) => Some(t),
-      Err(e) => panic!("Unable to start thread: {}", e),
-    };
-
-    barrier.wait();
-
-    device
+struct AddedDevice {
+    pub raw_handle: u64,
+    pub report_tx: Sender<Report>,
 }
+
+// fn create_device(dev: IOHIDDeviceRef, name: String) -> Device {
+//     let (mut report_tx, report_rx) = channel::<Report>();
+
+//     let mut device = Device {
+//         name: name.clone(),
+//         device_ref: dev,
+//         cid: CID_BROADCAST,
+//         report_recv: report_rx,
+//         report_send: report_tx.clone(),
+//     };
+
+//     // Use a barrier to block this function until the thread is ready
+//     // let barrier = Arc::new(Barrier::new(2));
+//     // let barrier_clone = barrier.clone();
+
+//     // Super, super sketchy, but we can't Send a libc::c_void to the thread, yet OSX wants us to do
+//     // just that. An alternative way to accomplish this might be to come up with enough information
+//     // for the thread to re-enumerate this device.
+//     let mut added_device = AddedDevice {
+//         raw_handle: unsafe { ::std::mem::transmute(dev) },
+//         report_tx: report_tx,
+//     };
+//     // device_tx.send(added_device);
+
+
+//     // unsafe {
+//     //     let runloop_ref : CFRunLoopRef = ::std::mem::transmute(runloop_raw_ref);
+//     //     IOHIDDeviceScheduleWithRunLoop(dev, runloop_ref, kCFRunLoopDefaultMode);
+//     // }
+//     // println!("Scheduled");
+
+//     // OK to start the run loop
+//     // barrier.wait();
+//     println!("Barrier unwaited");
+
+
+//     device
+// }
 
 impl Read for Device {
     fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<usize> {
@@ -152,29 +133,114 @@ impl U2FDevice for Device {
 
 pub struct PlatformManager {
     pub hid_manager: IOHIDManagerRef,
+    device_added: Sender<AddedDevice>,
+    known_devices: Vec<Device>,
 }
 
 pub fn open_platform_manager() -> io::Result<PlatformManager> {
-    // TODO: Remove this disconnect-removal channel, or rework it, or something
-    let (mut tx, rx) = channel::<IOHIDDeviceRef>();
+    let (mut added_tx, added_rx) = channel::<AddedDevice>();
 
+    let hid_manager: IOHIDManagerRef;
     unsafe {
-        let hid_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDManagerOptionNone);
+        hid_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDManagerOptionNone);
         IOHIDManagerSetDeviceMatching(hid_manager, ptr::null());
-
-        let tx_ptr: *mut libc::c_void = &mut tx as *mut _ as *mut libc::c_void;
-        IOHIDManagerRegisterDeviceRemovalCallback(hid_manager, device_unregistered_cb, tx_ptr);
-
-        // Start the manager
-        IOHIDManagerScheduleWithRunLoop(hid_manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 
         let result = IOHIDManagerOpen(hid_manager, kIOHIDManagerOptionNone);
         if result != KERN_SUCCESS {
             return Err(io::Error::from_raw_os_error(result));
         }
-
-        Ok(PlatformManager { hid_manager: hid_manager })
     }
+
+    let hid_manager_ptr: u64 = unsafe { ::std::mem::transmute(hid_manager) };
+    let thread = match thread::Builder::new().name("HID Runloop".to_string()).spawn(move || {
+    unsafe {
+        let (mut removal_tx, removal_rx) = channel::<IOHIDDeviceRef>();
+        let scratch_buf = [0; HID_RPT_SIZE];
+
+        let hid_manager: IOHIDManagerRef = ::std::mem::transmute(hid_manager_ptr);
+        let removal_tx_ptr: *mut libc::c_void = &mut removal_tx as *mut _ as *mut libc::c_void;
+        IOHIDManagerRegisterDeviceRemovalCallback(hid_manager, device_unregistered_cb, removal_tx_ptr);
+
+        // Start the manager
+        IOHIDManagerScheduleWithRunLoop(hid_manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+
+        // Run the Event Loop. CFRunLoopRunInMode() will dispatch HID input reports into the
+        // read_new_data_cb() callback.
+        loop {
+            println!("Run loop running, handle={:?}", thread::current());
+
+            match added_rx.try_recv() {
+                Ok(mut added_device) => {
+                    let device_handle : IOHIDDeviceRef = ::std::mem::transmute(added_device.raw_handle);
+                    let report_tx_ptr : *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
+
+                    println!("Added device! {:?}", device_handle);
+
+                    IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
+                                                           scratch_buf.len() as CFIndex,
+                                                           read_new_data_cb, report_tx_ptr);
+
+                    IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+
+                },
+                Err(_) => {},
+            };
+
+            #[allow(non_upper_case_globals)]
+            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, 1) {
+                kCFRunLoopRunStopped => {
+                    println!("Device stopped.");
+                    return;
+                },
+                _ => {},
+            }
+        }
+    }}) {
+        Ok(t) => Some(t),
+        Err(e) => panic!("Unable to start thread: {}", e),
+    };
+
+    println!("Finding ... ");
+    let mut device_refs: Vec<IOHIDDeviceRef> = Vec::new();
+    unsafe {
+        println!("Device counting...");
+        let device_set = IOHIDManagerCopyDevices(hid_manager);
+        if device_set.is_null() {
+            panic!("Could not get the set of devices");
+        }
+
+        // The OSX System call can take a void pointer _context, which we will use
+        // for the out variable, devices.
+        let devices_ptr: *mut libc::c_void = &mut device_refs as *mut _ as *mut libc::c_void;
+        CFSetApplyFunction(device_set, locate_hid_devices_cb, devices_ptr);
+    }
+
+    let mut devices: Vec<Device> = Vec::new();
+    for device_ref in device_refs {
+        let (mut report_tx, report_rx) = channel::<Report>();
+
+        let device = Device {
+            name: get_name(device_ref),
+            device_ref: device_ref,
+            cid: CID_BROADCAST,
+            report_recv: report_rx,
+            report_send: report_tx.clone(),
+        };
+
+        added_tx.send(AddedDevice {
+            raw_handle: unsafe { ::std::mem::transmute(device_ref) },
+            report_tx: report_tx,
+        });
+
+        println!("Initialized {}", device);
+        devices.push(device);
+    }
+
+    Ok(PlatformManager {
+        hid_manager: hid_manager,
+        device_added: added_tx,
+        known_devices: devices,
+    })
 }
 
 impl PlatformManager {
@@ -190,26 +256,44 @@ impl PlatformManager {
 
     pub fn find_keys(&self) -> io::Result<Vec<Device>>
     {
-        println!("Finding ... ");
-        let mut devices = vec![];
-        unsafe {
-            println!("Device counting...");
-            let device_set = IOHIDManagerCopyDevices(self.hid_manager);
-            if device_set.is_null() {
-                panic!("Could not get the set of devices");
-            }
+        // println!("Finding ... ");
+        // let mut device_refs: Vec<IOHIDDeviceRef> = Vec::new();
+        // unsafe {
+        //     println!("Device counting...");
+        //     let device_set = IOHIDManagerCopyDevices(self.hid_manager);
+        //     if device_set.is_null() {
+        //         panic!("Could not get the set of devices");
+        //     }
 
-            println!("Device set...");
-            // let count = CFSetGetCount(device_set);
-            // println!("Device count: {}", count);
+        //     // The OSX System call can take a void pointer _context, which we will use
+        //     // for the out variable, devices.
+        //     let devices_ptr: *mut libc::c_void = &mut device_refs as *mut _ as *mut libc::c_void;
+        //     CFSetApplyFunction(device_set, locate_hid_devices_cb, devices_ptr);
+        // }
 
-            // The OSX System call can take a void pointer _context, which we will use
-            // for the out variable, devices.
-            let devices_ptr: *mut libc::c_void = &mut devices as *mut _ as *mut libc::c_void;
-            CFSetApplyFunction(device_set, locate_hid_devices_cb, devices_ptr);
-        }
+        // let mut devices: Vec<Device> = Vec::new();
+        // for device_ref in device_refs {
+        //     let (mut report_tx, report_rx) = channel::<Report>();
 
-        Ok(devices)
+        //     let device = Device {
+        //         name: get_name(device_ref),
+        //         device_ref: device_ref,
+        //         cid: CID_BROADCAST,
+        //         report_recv: report_rx,
+        //         report_send: report_tx.clone(),
+        //     };
+
+        //     self.device_added.send(AddedDevice {
+        //         raw_handle: unsafe { ::std::mem::transmute(device_ref) },
+        //         report_tx: report_tx,
+        //     });
+
+        //     println!("Initialized {}", device);
+        //     devices.push(device);
+        // }
+        // let mut devices: Vec<Device> = Vec::new();
+        // Ok(devices)
+        Ok(self.known_devices)
     }
 }
 
@@ -284,6 +368,20 @@ unsafe fn is_u2f_device(device_ref: IOHIDDeviceRef) -> bool {
     is_u2f
 }
 
+fn get_name(device_ref: IOHIDDeviceRef) -> String {
+    let mut name = "Unknown device".to_string();
+    unsafe {
+        let vendor_id = get_int_property(device_ref, kIOHIDVendorIDKey());
+        let product_id = get_int_property(device_ref, kIOHIDProductIDKey());
+        let device_usage = get_usage(device_ref);
+        let device_usage_page = get_usage_page(device_ref);
+
+        name = format!("Vendor={} Product={} Page={} Usage={}", vendor_id, product_id,
+                       device_usage_page, device_usage);
+    }
+    name
+}
+
 // This is called from the RunLoop thread
 extern "C" fn read_new_data_cb(context: *mut c_void,
                                _: IOReturn,
@@ -347,22 +445,13 @@ extern "C" fn device_unregistered_cb(context: *mut c_void,
 extern "C" fn locate_hid_devices_cb(void_ref: CFTypeRef, context: *const c_void) {
     unsafe {
         // context contains a Vec<Device> which we populate as the out variable
-        let devices: &mut Vec<Device> = &mut *(context as *mut Vec<Device>);
+        let devices: &mut Vec<IOHIDDeviceRef> = &mut *(context as *mut Vec<IOHIDDeviceRef>);
 
         let device_ref = void_ref as IOHIDDeviceRef;
 
         if is_u2f_device(device_ref) {
-            let vendor_id = get_int_property(device_ref, kIOHIDVendorIDKey());
-            let product_id = get_int_property(device_ref, kIOHIDProductIDKey());
-            let device_usage = get_usage(device_ref);
-            let device_usage_page = get_usage_page(device_ref);
-
-            let name = format!("Vendor={} Product={} Page={} Usage={}",
-                     vendor_id, product_id, device_usage_page, device_usage);
-
-            println!("{:?} FIDO-compliant Device Found: {}", thread::current(), name);
-
-            devices.push(create_device(device_ref, name));
+            println!("Found U2F Device, passing it back...");
+            devices.push(device_ref);
         }
     }
 }
