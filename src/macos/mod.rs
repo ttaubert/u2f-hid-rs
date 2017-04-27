@@ -9,9 +9,10 @@ use std::io;
 use std::fmt;
 use std::mem;
 use std::ptr;
-use std::sync::{Arc, Barrier};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::thread;
+use std::time::Duration;
 
 use libc::{c_char, c_void};
 
@@ -26,6 +27,9 @@ use core_foundation_sys::runloop::*;
 
 use consts::{CID_BROADCAST, FIDO_USAGE_PAGE, FIDO_USAGE_U2FHID, HID_RPT_SIZE};
 use U2FDevice;
+
+const READ_TIMEOUT: u64 = 15;
+
 pub struct Report {
     pub data: [u8; HID_RPT_SIZE],
 }
@@ -39,12 +43,11 @@ pub struct InternalDevice {
     // trait.
     pub cid: [u8; 4],
     pub report_recv: Receiver<Report>,
-    pub report_send: Sender<Report>,
 }
 
 impl fmt::Display for InternalDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "InternalDevice({}, ptr:{:?}, cid: {:02x}{:02x}{:02x}{:02x})", self.name, self.device_ref,
+        write!(f, "InternalDevice({}, ref:{:?}, cid: {:02x}{:02x}{:02x}{:02x})", self.name, self.device_ref,
                self.cid[0], self.cid[1], self.cid[2], self.cid[3])
     }
 }
@@ -52,6 +55,7 @@ impl fmt::Display for InternalDevice {
 struct AddedDevice {
     pub raw_handle: u64,
     pub report_tx: Sender<Report>,
+    pub is_started: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Clone)]
@@ -73,10 +77,16 @@ impl PartialEq for Device {
 
 impl Read for Device {
     fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<usize> {
-        println!("Reading");
-        let report_data = match self.device.report_recv.recv() {
+        println!("Reading {}", self);
+        let timeout = Duration::from_secs(READ_TIMEOUT);
+        let report_data = match self.device.report_recv.recv_timeout(timeout) {
             Ok(v) => v,
-            Err(e) => panic!("Couldn't read data: {}", e),
+            Err(e) => {
+                if e == RecvTimeoutError::Timeout {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, e));
+                }
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, e));
+            },
         };
         let len = bytes.write(&report_data.data).unwrap();
         Ok(len)
@@ -85,6 +95,7 @@ impl Read for Device {
 
 impl Write for Device {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        println!("Sending on {}", self);
         unsafe { set_report(self.device.device_ref, kIOHIDReportTypeOutput, bytes) }
     }
 
@@ -130,7 +141,8 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     let thread = match thread::Builder::new().name("HID Runloop".to_string()).spawn(move || {
     unsafe {
         let (mut removal_tx, removal_rx) = channel::<IOHIDDeviceRef>();
-        let scratch_buf = [0; HID_RPT_SIZE];
+        let mut storage_of_scratch_bufs = Vec::new();
+        let mut storage_of_tx_handles = Vec::new();
 
         let hid_manager: IOHIDManagerRef = ::std::mem::transmute(hid_manager_ptr);
         let removal_tx_ptr: *mut libc::c_void = &mut removal_tx as *mut _ as *mut libc::c_void;
@@ -146,23 +158,37 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
 
             match added_rx.try_recv() {
                 Ok(mut added_device) => {
-                    let device_handle : IOHIDDeviceRef = ::std::mem::transmute(added_device.raw_handle);
-                    let report_tx_ptr : *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
+                    let device_handle: IOHIDDeviceRef = ::std::mem::transmute(added_device.raw_handle);
+                    let report_tx_ptr: *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
+
+                    // DEBUG added_device.report_tx.send(Report { data: [0; HID_RPT_SIZE] });
+
+                    // Keep around tx handles so the channels don't die
+                    // TODO: Clean up old handles when needed
+                    storage_of_tx_handles.push(added_device.report_tx);
 
                     println!("Added device! {:?}", device_handle);
 
+                    IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(),
+                                                   kCFRunLoopDefaultMode);
+
+                    let scratch_buf = [0; HID_RPT_SIZE];
                     IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
                                                            scratch_buf.len() as CFIndex,
                                                            read_new_data_cb, report_tx_ptr);
+                    storage_of_scratch_bufs.push(scratch_buf);
 
-                    IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-
+                    // Notify anyone waiting on this device that it's ready
+                    let &(ref lock, ref cvar) = &*added_device.is_started;
+                    let mut started = lock.lock().unwrap();
+                    *started = true;
+                    cvar.notify_all();
                 },
                 Err(_) => {},
             };
 
             #[allow(non_upper_case_globals)]
-            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, 1) {
+            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 1) {
                 kCFRunLoopRunStopped => {
                     println!("Device stopped.");
                     return;
@@ -178,7 +204,6 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     println!("Finding ... ");
     let mut device_refs: Vec<IOHIDDeviceRef> = Vec::new();
     unsafe {
-        println!("Device counting...");
         let device_set = IOHIDManagerCopyDevices(hid_manager);
         if device_set.is_null() {
             panic!("Could not get the set of devices");
@@ -192,14 +217,15 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
 
     let mut devices: Vec<Device> = Vec::new();
     for device_ref in device_refs {
-        let (mut report_tx, report_rx) = channel::<Report>();
+        let (report_tx, report_rx) = channel::<Report>();
+
+        let started_conditon = Arc::new((Mutex::new(false), Condvar::new()));
 
         let int_device = InternalDevice {
             name: get_name(device_ref),
             device_ref: device_ref,
             cid: CID_BROADCAST,
             report_recv: report_rx,
-            report_send: report_tx.clone(),
         };
 
         let device = Device {
@@ -209,9 +235,17 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         added_tx.send(AddedDevice {
             raw_handle: unsafe { ::std::mem::transmute(device_ref) },
             report_tx: report_tx,
+            is_started: started_conditon.clone(),
         });
 
-        println!("Initialized {}", device);
+        // Wait for this device to become ready
+        let &(ref lock, ref cvar) = &*started_conditon;
+        let mut started = lock.lock().unwrap();
+        while !*started {
+            started = cvar.wait(started).unwrap();
+        }
+
+        println!("Readied {}", device);
         devices.push(device);
     }
 
@@ -348,17 +382,15 @@ unsafe fn is_u2f_device(device_ref: IOHIDDeviceRef) -> bool {
 }
 
 fn get_name(device_ref: IOHIDDeviceRef) -> String {
-    let mut name = "Unknown device".to_string();
     unsafe {
         let vendor_id = get_int_property(device_ref, kIOHIDVendorIDKey());
         let product_id = get_int_property(device_ref, kIOHIDProductIDKey());
         let device_usage = get_usage(device_ref);
         let device_usage_page = get_usage_page(device_ref);
 
-        name = format!("Vendor={} Product={} Page={} Usage={}", vendor_id, product_id,
-                       device_usage_page, device_usage);
+        format!("Vendor={} Product={} Page={} Usage={}", vendor_id, product_id,
+                device_usage_page, device_usage)
     }
-    name
 }
 
 // This is called from the RunLoop thread
@@ -372,20 +404,15 @@ extern "C" fn read_new_data_cb(context: *mut c_void,
     unsafe {
         let tx: &mut Sender<Report> = &mut *(context as *mut Sender<Report>);
 
-        println!("read_new_data_cb type={} id={} report={:?} len={}",
-                 report_type,
-                 report_id,
-                 report,
-                 report_len);
+        println!("read_new_data_cb tx={:?} type={} id={} report={:?} len={}",
+                 context, report_type, report_id, report, report_len);
 
         let mut report_obj = Report { data: [0; HID_RPT_SIZE] };
 
         if report_len as usize <= HID_RPT_SIZE {
             ptr::copy(report, report_obj.data.as_mut_ptr(), report_len as usize);
         } else {
-            println!("read_new_data_cb got too much data! {} > {}",
-                     report_len,
-                     HID_RPT_SIZE);
+            println!("read_new_data_cb got too much data! {} > {}", report_len, HID_RPT_SIZE);
         }
 
         if let Err(e) = tx.send(report_obj) {
@@ -394,6 +421,8 @@ extern "C" fn read_new_data_cb(context: *mut c_void,
             // properly later.
             println!("Problem returning read_new_data_cb data for thread: {}", e);
         };
+
+        println!("callback completed {:?}", context);
     }
 }
 
@@ -409,7 +438,8 @@ extern "C" fn device_unregistered_cb(context: *mut c_void,
         // let device: &mut Device = &mut *(context as *mut Device);
 
         // let device_ref = void_ref as IOHIDDeviceRef;
-        println!("{:?} device_unregistered_cb context={:?} result={:?} device_ref={:?}", thread::current(), context, result, device);
+        println!("{:?} device_unregistered_cb context={:?} result={:?} device_ref={:?}",
+                 thread::current(), context, result, device);
 
         if let Err(e) = tx.send(device) {
             // TOOD: This happens when the channel closes before this thread
