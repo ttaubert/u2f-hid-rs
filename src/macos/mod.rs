@@ -170,7 +170,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         }
     }}) {
         Ok(t) => Some(t),
-        Err(e) => panic!("Unable to start thread: {}", e),
+        Err(e) => return Err(e),
     };
 
     println!("Finding ... ");
@@ -178,7 +178,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     unsafe {
         let device_set = IOHIDManagerCopyDevices(hid_manager);
         if device_set.is_null() {
-            panic!("Could not get the set of devices");
+            return Err(io::Error::new(io::ErrorKind::Other, "Could not get the set of devices"));
         }
 
         // The OSX System call can take a void pointer _context, which we will use
