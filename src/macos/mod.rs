@@ -173,8 +173,8 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
 
                     println!("Added device! {:?}", device_handle);
 
-                    IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(),
-                                                   kCFRunLoopDefaultMode);
+                    // IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(),
+                    //                                kCFRunLoopDefaultMode);
 
                     // let scratch_buf = [0; HID_RPT_SIZE];
                     // IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
@@ -282,43 +282,6 @@ impl PlatformManager {
 
     pub fn find_keys(&self) -> io::Result<Vec<Device>>
     {
-        // println!("Finding ... ");
-        // let mut device_refs: Vec<IOHIDDeviceRef> = Vec::new();
-        // unsafe {
-        //     println!("Device counting...");
-        //     let device_set = IOHIDManagerCopyDevices(self.hid_manager);
-        //     if device_set.is_null() {
-        //         panic!("Could not get the set of devices");
-        //     }
-
-        //     // The OSX System call can take a void pointer _context, which we will use
-        //     // for the out variable, devices.
-        //     let devices_ptr: *mut libc::c_void = &mut device_refs as *mut _ as *mut libc::c_void;
-        //     CFSetApplyFunction(device_set, locate_hid_devices_cb, devices_ptr);
-        // }
-
-        // let mut devices: Vec<Device> = Vec::new();
-        // for device_ref in device_refs {
-        //     let (mut report_tx, report_rx) = channel::<Report>();
-
-        //     let device = Device {
-        //         name: get_name(device_ref),
-        //         device_ref: device_ref,
-        //         cid: CID_BROADCAST,
-        //         report_recv: report_rx,
-        //         report_send: report_tx.clone(),
-        //     };
-
-        //     self.device_added.send(AddedDevice {
-        //         raw_handle: unsafe { ::std::mem::transmute(device_ref) },
-        //         report_tx: report_tx,
-        //     });
-
-        //     println!("Initialized {}", device);
-        //     devices.push(device);
-        // }
-        // let mut devices: Vec<Device> = Vec::new();
-        // Ok(devices)
         Ok(self.known_devices.clone())
     }
 }
