@@ -46,8 +46,10 @@ impl U2FManager {
                 // This indexing is because I don't know how to use .iter() and
                 // keep the U2FDevice traits
                 for idx in 0..list.len() {
+                    println!("Register {}", list[idx]);
                     match u2fhid::u2f_register(&mut list[idx], challenge, application) {
                         Ok(v) => {
+                            println!("Register OK {:?}", v);
                             // First to complete, we return
                             // TODO: Cancel the others?
                             for cancel_idx in 0..list.len() {

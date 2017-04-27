@@ -192,7 +192,6 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     let mut devices: Vec<Device> = Vec::new();
     for device_ref in device_refs {
         let (mut report_tx, report_rx) = channel::<Report>();
-        let report_tx_ptr: *mut libc::c_void = unsafe { &mut report_tx as *mut _ as *mut libc::c_void };
 
         let started_conditon = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -207,6 +206,8 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         let device = Device {
             device: Arc::new(RwLock::new(int_device)),
         };
+
+        let report_tx_ptr: *mut libc::c_void = unsafe { &mut device.device.read().unwrap().report_send.clone() as *mut _ as *mut libc::c_void };
 
         unsafe {
             IOHIDDeviceRegisterInputReportCallback(device_ref, scratch_buf.as_ptr(),
@@ -333,26 +334,32 @@ extern "C" fn read_new_data_cb(context: *mut c_void,
                                report_id: u32,
                                report: *mut u8,
                                report_len: CFIndex) {
-    println!("read_new_data_cb tx={:?} type={} id={} report={:?} len={}",
-             context, report_type, report_id, report, report_len);
+    unsafe {
+        let tx: &mut Sender<Report> = &mut *(context as *mut Sender<Report>);
 
-    let mut report_obj = Report { data: [0; HID_RPT_SIZE] };
+        println!("read_new_data_cb type={} id={} report={:?} len={}",
+                 report_type,
+                 report_id,
+                 report,
+                 report_len);
 
-    if report_len as usize <= HID_RPT_SIZE {
-        unsafe { ptr::copy(report, report_obj.data.as_mut_ptr(), report_len as usize) };
-    } else {
-        println!("read_new_data_cb got too much data! {} > {}", report_len, HID_RPT_SIZE);
+        let mut report_obj = Report { data: [0; HID_RPT_SIZE] };
+
+        if report_len as usize <= HID_RPT_SIZE {
+            ptr::copy(report, report_obj.data.as_mut_ptr(), report_len as usize);
+        } else {
+            println!("read_new_data_cb got too much data! {} > {}",
+                     report_len,
+                     HID_RPT_SIZE);
+        }
+
+        if let Err(e) = tx.send(report_obj) {
+            // TOOD: This happens when the channel closes before this thread
+            // does. This is pretty common, but let's deal with stopping
+            // properly later.
+            println!("Problem returning read_new_data_cb data for thread: {}", e);
+        };
     }
-
-    let tx: &mut Sender<Report> = unsafe { &mut *(context as *mut Sender<Report>) };
-    if let Err(e) = tx.send(report_obj) {
-        // TOOD: This happens when the channel closes before this thread
-        // does. This is pretty common, but let's deal with stopping
-        // properly later.
-        println!("Problem returning read_new_data_cb data for thread: {}", e);
-    };
-
-    println!("callback completed {:?}", context);
 }
 
 // This is called from the RunLoop thread
