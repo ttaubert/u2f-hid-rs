@@ -43,6 +43,7 @@ pub struct InternalDevice {
     // trait.
     pub cid: [u8; 4],
     pub report_recv: Receiver<Report>,
+    pub report_send: Sender<Report>,
 }
 
 impl fmt::Display for InternalDevice {
@@ -231,6 +232,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
             name: get_name(device_ref),
             device_ref: device_ref,
             cid: CID_BROADCAST,
+            report_send: report_tx.clone(),
             report_recv: report_rx,
         };
 
@@ -377,29 +379,26 @@ extern "C" fn read_new_data_cb(context: *mut c_void,
                                report_id: u32,
                                report: *mut u8,
                                report_len: CFIndex) {
-    unsafe {
-        let tx: &mut Sender<Report> = &mut *(context as *mut Sender<Report>);
+    println!("read_new_data_cb tx={:?} type={} id={} report={:?} len={}",
+             context, report_type, report_id, report, report_len);
 
-        println!("read_new_data_cb tx={:?} type={} id={} report={:?} len={}",
-                 context, report_type, report_id, report, report_len);
+    let mut report_obj = Report { data: [0; HID_RPT_SIZE] };
 
-        let mut report_obj = Report { data: [0; HID_RPT_SIZE] };
-
-        if report_len as usize <= HID_RPT_SIZE {
-            ptr::copy(report, report_obj.data.as_mut_ptr(), report_len as usize);
-        } else {
-            println!("read_new_data_cb got too much data! {} > {}", report_len, HID_RPT_SIZE);
-        }
-
-        if let Err(e) = tx.send(report_obj) {
-            // TOOD: This happens when the channel closes before this thread
-            // does. This is pretty common, but let's deal with stopping
-            // properly later.
-            println!("Problem returning read_new_data_cb data for thread: {}", e);
-        };
-
-        println!("callback completed {:?}", context);
+    if report_len as usize <= HID_RPT_SIZE {
+        unsafe { ptr::copy(report, report_obj.data.as_mut_ptr(), report_len as usize) };
+    } else {
+        println!("read_new_data_cb got too much data! {} > {}", report_len, HID_RPT_SIZE);
     }
+
+    let tx: &mut Sender<Report> = unsafe { &mut *(context as *mut Sender<Report>) };
+    if let Err(e) = tx.send(report_obj) {
+        // TOOD: This happens when the channel closes before this thread
+        // does. This is pretty common, but let's deal with stopping
+        // properly later.
+        println!("Problem returning read_new_data_cb data for thread: {}", e);
+    };
+
+    println!("callback completed {:?}", context);
 }
 
 // This is called from the RunLoop thread
