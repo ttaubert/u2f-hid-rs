@@ -146,8 +146,6 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     let thread = match thread::Builder::new().name("HID Runloop".to_string()).spawn(move || {
     unsafe {
         let (mut removal_tx, removal_rx) = channel::<IOHIDDeviceRef>();
-        // let mut storage_of_scratch_bufs = Vec::new();
-        let mut storage_of_tx_handles = Vec::new();
 
         let hid_manager: IOHIDManagerRef = ::std::mem::transmute(hid_manager_ptr);
         let removal_tx_ptr: *mut libc::c_void = &mut removal_tx as *mut _ as *mut libc::c_void;
@@ -161,39 +159,8 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         loop {
             println!("Run loop running, handle={:?}", thread::current());
 
-            match added_rx.try_recv() {
-                Ok(mut added_device) => {
-                    let device_handle: IOHIDDeviceRef = ::std::mem::transmute(added_device.raw_handle);
-                    // let report_tx_ptr: *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
-
-                    // DEBUG added_device.report_tx.send(Report { data: [0; HID_RPT_SIZE] });
-
-                    // Keep around tx handles so the channels don't die
-                    // TODO: Clean up old handles when needed
-                    storage_of_tx_handles.push(added_device.report_tx);
-
-                    println!("Added device! {:?}", device_handle);
-
-                    // IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(),
-                    //                                kCFRunLoopDefaultMode);
-
-                    // let scratch_buf = [0; HID_RPT_SIZE];
-                    // IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
-                    //                                        scratch_buf.len() as CFIndex,
-                    //                                        read_new_data_cb, report_tx_ptr);
-                    // storage_of_scratch_bufs.push(scratch_buf);
-
-                    // Notify anyone waiting on this device that it's ready
-                    let &(ref lock, ref cvar) = &*added_device.is_started;
-                    let mut started = lock.lock().unwrap();
-                    *started = true;
-                    cvar.notify_all();
-                },
-                Err(_) => {},
-            };
-
             #[allow(non_upper_case_globals)]
-            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 1) {
+            match CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 0) {
                 kCFRunLoopRunStopped => {
                     println!("Device stopped.");
                     return;
@@ -225,6 +192,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     let mut devices: Vec<Device> = Vec::new();
     for device_ref in device_refs {
         let (mut report_tx, report_rx) = channel::<Report>();
+        let report_tx_ptr: *mut libc::c_void = unsafe { &mut report_tx as *mut _ as *mut libc::c_void };
 
         let started_conditon = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -232,7 +200,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
             name: get_name(device_ref),
             device_ref: device_ref,
             cid: CID_BROADCAST,
-            report_send: report_tx.clone(),
+            report_send: report_tx,
             report_recv: report_rx,
         };
 
@@ -240,24 +208,10 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
             device: Arc::new(RwLock::new(int_device)),
         };
 
-        added_tx.send(AddedDevice {
-            raw_handle: unsafe { ::std::mem::transmute(device_ref) },
-            report_tx: report_tx.clone(),
-            is_started: started_conditon.clone(),
-        });
-
         unsafe {
-        let report_tx_ptr: *mut libc::c_void = &mut report_tx as *mut _ as *mut libc::c_void;
-        IOHIDDeviceRegisterInputReportCallback(device_ref, scratch_buf.as_ptr(),
-                                               scratch_buf.len() as CFIndex,
-                                               read_new_data_cb, report_tx_ptr);
-        }
-
-        // Wait for this device to become ready
-        let &(ref lock, ref cvar) = &*started_conditon;
-        let mut started = lock.lock().unwrap();
-        while !*started {
-            started = cvar.wait(started).unwrap();
+            IOHIDDeviceRegisterInputReportCallback(device_ref, scratch_buf.as_ptr(),
+                                                   scratch_buf.len() as CFIndex,
+                                                   read_new_data_cb, report_tx_ptr);
         }
 
         println!("Readied {}", device);
