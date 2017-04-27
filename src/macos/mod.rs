@@ -9,7 +9,7 @@ use std::io;
 use std::fmt;
 use std::mem;
 use std::ptr;
-use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -60,26 +60,30 @@ struct AddedDevice {
 
 #[derive(Clone)]
 pub struct Device {
-    pub device: Arc<InternalDevice>,
+    pub device: Arc<RwLock<InternalDevice>>,
 }
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Device({})", self.device)
+        let int_device = self.device.read().unwrap();
+        write!(f, "Device({})", *int_device)
     }
 }
 
 impl PartialEq for Device {
     fn eq(&self, other: &Device) -> bool {
-        self.device.device_ref == other.device.device_ref
+        let int_device = self.device.read().unwrap();
+        let other_device = other.device.read().unwrap();
+        int_device.device_ref == other_device.device_ref
     }
 }
 
 impl Read for Device {
     fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<usize> {
-        println!("Reading {}", self);
+        let int_device = self.device.write().unwrap();
+        println!("Reading {}", *int_device);
         let timeout = Duration::from_secs(READ_TIMEOUT);
-        let report_data = match self.device.report_recv.recv_timeout(timeout) {
+        let report_data = match int_device.report_recv.recv_timeout(timeout) {
             Ok(v) => v,
             Err(e) => {
                 if e == RecvTimeoutError::Timeout {
@@ -95,8 +99,9 @@ impl Read for Device {
 
 impl Write for Device {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        println!("Sending on {}", self);
-        unsafe { set_report(self.device.device_ref, kIOHIDReportTypeOutput, bytes) }
+        let int_device = self.device.write().unwrap();
+        println!("Sending on {}", *int_device);
+        unsafe { set_report(int_device.device_ref, kIOHIDReportTypeOutput, bytes) }
     }
 
     // USB HID writes don't buffer, so this will be a nop.
@@ -107,13 +112,12 @@ impl Write for Device {
 
 impl U2FDevice for Device {
     fn get_cid(&self) -> [u8; 4] {
-        return self.device.cid.clone();
+        let int_device = self.device.read().unwrap();
+        return int_device.cid.clone();
     }
     fn set_cid(&mut self, cid: &[u8; 4]) {
-        match Arc::get_mut(&mut self.device) {
-            Some(d) => d.cid.clone_from(cid),
-            None => panic!("Couldn't update CID"),
-        }
+        let mut int_device = self.device.write().unwrap();
+        int_device.cid.clone_from(cid);
     }
 }
 
@@ -231,7 +235,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         };
 
         let device = Device {
-            device: Arc::new(int_device),
+            device: Arc::new(RwLock::new(int_device)),
         };
 
         added_tx.send(AddedDevice {
