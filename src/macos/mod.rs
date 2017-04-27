@@ -141,7 +141,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
     let thread = match thread::Builder::new().name("HID Runloop".to_string()).spawn(move || {
     unsafe {
         let (mut removal_tx, removal_rx) = channel::<IOHIDDeviceRef>();
-        let mut storage_of_scratch_bufs = Vec::new();
+        // let mut storage_of_scratch_bufs = Vec::new();
         let mut storage_of_tx_handles = Vec::new();
 
         let hid_manager: IOHIDManagerRef = ::std::mem::transmute(hid_manager_ptr);
@@ -159,7 +159,7 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
             match added_rx.try_recv() {
                 Ok(mut added_device) => {
                     let device_handle: IOHIDDeviceRef = ::std::mem::transmute(added_device.raw_handle);
-                    let report_tx_ptr: *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
+                    // let report_tx_ptr: *mut libc::c_void = &mut added_device.report_tx as *mut _ as *mut libc::c_void;
 
                     // DEBUG added_device.report_tx.send(Report { data: [0; HID_RPT_SIZE] });
 
@@ -172,11 +172,11 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
                     IOHIDDeviceScheduleWithRunLoop(device_handle, CFRunLoopGetCurrent(),
                                                    kCFRunLoopDefaultMode);
 
-                    let scratch_buf = [0; HID_RPT_SIZE];
-                    IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
-                                                           scratch_buf.len() as CFIndex,
-                                                           read_new_data_cb, report_tx_ptr);
-                    storage_of_scratch_bufs.push(scratch_buf);
+                    // let scratch_buf = [0; HID_RPT_SIZE];
+                    // IOHIDDeviceRegisterInputReportCallback(device_handle, scratch_buf.as_ptr(),
+                    //                                        scratch_buf.len() as CFIndex,
+                    //                                        read_new_data_cb, report_tx_ptr);
+                    // storage_of_scratch_bufs.push(scratch_buf);
 
                     // Notify anyone waiting on this device that it's ready
                     let &(ref lock, ref cvar) = &*added_device.is_started;
@@ -215,9 +215,11 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
         CFSetApplyFunction(device_set, locate_hid_devices_cb, devices_ptr);
     }
 
+    let scratch_buf = [0; HID_RPT_SIZE];
+
     let mut devices: Vec<Device> = Vec::new();
     for device_ref in device_refs {
-        let (report_tx, report_rx) = channel::<Report>();
+        let (mut report_tx, report_rx) = channel::<Report>();
 
         let started_conditon = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -234,9 +236,16 @@ pub fn open_platform_manager() -> io::Result<PlatformManager> {
 
         added_tx.send(AddedDevice {
             raw_handle: unsafe { ::std::mem::transmute(device_ref) },
-            report_tx: report_tx,
+            report_tx: report_tx.clone(),
             is_started: started_conditon.clone(),
         });
+
+        unsafe {
+        let report_tx_ptr: *mut libc::c_void = &mut report_tx as *mut _ as *mut libc::c_void;
+        IOHIDDeviceRegisterInputReportCallback(device_ref, scratch_buf.as_ptr(),
+                                               scratch_buf.len() as CFIndex,
+                                               read_new_data_cb, report_tx_ptr);
+        }
 
         // Wait for this device to become ready
         let &(ref lock, ref cvar) = &*started_conditon;
